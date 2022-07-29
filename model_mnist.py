@@ -6,6 +6,7 @@ import os
 import random
 from torch.autograd import Variable
 from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler, autocast
 import data_utils
 import numpy as np
 import time
@@ -215,7 +216,6 @@ def plot(x, epoch,p = False):
     return mse / 10.0
 
 
-# --------- training funtions ------------------------------------
 def train(x,e):
     frame_predictor.zero_grad()
     encoder.zero_grad()
@@ -232,19 +232,27 @@ def train(x,e):
 
     memo = Variable(torch.zeros(opt.batch_size, opt.rnn_size ,3, int(opt.image_width/8), int(opt.image_width/8)).cuda())
 
-    for i in range(1, opt.n_past + opt.n_future):
-        h = encoder(x[i - 1], True)
-        h_pred, memo, hidden = frame_predictor((h,memo), hidden)
-        x_pred = encoder(h_pred,False)
-        mse +=  (mse_criterion(x_pred, x[i]))
-    loss = mse
-    print(mse)
-    loss.backward()
+    with autocast(enabled=True):
+        for i in range(1, opt.n_past + opt.n_future):
+            h = encoder(x[i - 1], True)
+            h_pred, memo, hidden = frame_predictor((h,memo), hidden)
+            x_pred = encoder(h_pred,False)
+            mse +=  (mse_criterion(x_pred, x[i]))
+        loss = mse
+    print(loss)
+    scaler.scale(loss).backward()
+    scaler.step(frame_predictor_optimizer)
+    scaler.step(encoder_optimizer)
+    scaler.update()
+    #loss.backward()
 
-    frame_predictor_optimizer.step()
-    encoder_optimizer.step()
+    #frame_predictor_optimizer.step()
+    #encoder_optimizer.step()
 
     return mse.data.cpu().numpy() / (opt.n_past + opt.n_future)
+
+# --------- training loop ------------------------------------
+scaler = GradScaler(enabled=True)
 
 
 
