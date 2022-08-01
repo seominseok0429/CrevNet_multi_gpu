@@ -14,6 +14,9 @@ import pssim.pytorch_ssim as pytorch_ssim
 from skimage.measure import compare_ssim
 from tqdm import trange
 
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--lr', default=0.0005, type=float, help='learning rate')
@@ -43,6 +46,12 @@ parser.add_argument('--num_digits', type=int, default=2, help='number of digits 
 
 
 opt = parser.parse_args()
+
+torch.distributed.init_process_group(backend="nccl")
+
+local_rank = opt.local_rank
+scaler = GradScaler(enabled=True)
+device = torch.device("cuda:{}".format(local_rank))
 
 
 
@@ -84,21 +93,28 @@ import layers_3d as model
 
 
 frame_predictor = model.zig_rev_predictor(opt.rnn_size,  opt.rnn_size, opt.rnn_size, opt.predictor_rnn_layers,opt.batch_size)
-encoder = model.autoencoder(nBlocks=[4,5,3], nStrides=[1, 2, 2], nChannels=None, init_ds=2, dropout_rate=0., affineBN=True, in_shape=[opt.channels, opt.image_width, opt.image_width], mult=2)
+encoder = model.autoencoder(nBlocks=[4,5,3], nStrides=[1, 2, 2],
+                    nChannels=None, init_ds=2,
+                    dropout_rate=0., affineBN=True, in_shape=[opt.channels, opt.image_width, opt.image_width],
+                    mult=2)
 
-frame_predictor = frame_predictor.to('cuda')
-encoder = encoder.to('cuda')
+frame_predictor = frame_predictor.to(device)
+encoder = encoder.to(device)
 
-frame_predictor = torch.nn.DataParallel(frame_predictor)
-encoder =  torch.nn.DataParallel(encoder)
-# 
+frame_predictor = nn.SyncBatchNorm.convert_sync_batchnorm(frame_predictor)
+encoder = nn.SyncBatchNorm.convert_sync_batchnorm(encoder)
 
-frame_predictor_optimizer = opt.optimizer(frame_predictor.module.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
-encoder_optimizer = opt.optimizer(encoder.module.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
+frame_predictor = torch.nn.parallel.DistributedDataParallel(frame_predictor, device_ids=[local_rank], output_device=local_rank)
+encoder = torch.nn.parallel.DistributedDataParallel(encoder, device_ids=[local_rank], output_device=local_rank)
+
+
+frame_predictor_optimizer = opt.optimizer(frame_predictor.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
+encoder_optimizer = opt.optimizer(encoder.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
 
 
 scheduler1 = torch.optim.lr_scheduler.StepLR(frame_predictor_optimizer, step_size=50, gamma=0.2)
 scheduler2 = torch.optim.lr_scheduler.StepLR(encoder_optimizer, step_size=50, gamma=0.2)
+
 
 
 # --------- loss functions ------------------------------------
@@ -108,19 +124,26 @@ mse_criterion.cuda()
 
 # --------- load a dataset ------------------------------------
 train_data, test_data = data_utils.load_dataset(opt)
+train_sampler = DistributedSampler(dataset = train_data)
+test_sampler = DistributedSampler(dataset = test_data)
+
 
 train_loader = DataLoader(train_data,
                           num_workers=opt.data_threads,
                           batch_size=opt.batch_size,
-                          shuffle=True,
+                          shuffle=False,
                           drop_last=True,
-                          pin_memory=True)
+                          sampler=train_sampler,
+                          pin_memory=False)
+
 test_loader = DataLoader(test_data,
                          num_workers=opt.data_threads,
                          batch_size=opt.batch_size,
-                         shuffle=True,
+                         shuffle=False,
                          drop_last=True,
-                         pin_memory=True)
+                         sampler=test_sampler,
+                         pin_memory=False)
+
 
 
 def get_training_batch():
